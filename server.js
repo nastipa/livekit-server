@@ -177,7 +177,7 @@ app.post("/token", async (req, res) => {
     // 5. CREATE LIVEKIT ROOM NAME
     // ----------------------------------------------
 
-    const roomName = nasara-${stream.id};
+    const roomName = `nasara-${stream.id}`;
 
     // ----------------------------------------------
     // 6. GENERATE LIVEKIT ACCESS TOKEN
@@ -229,5 +229,5 @@ app.post("/token", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
-  console.log(Nasara LiveKit server running on port ${PORT});
+  console.log(`Nasara LiveKit server running on port ${PORT}`);
 });
