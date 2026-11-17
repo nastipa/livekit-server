@@ -351,6 +351,62 @@ app.post("/speaker/request", async (req, res) => {
     });
   }
 });
+// ==================================================
+// VIEWER: CHECK OWN SPEAKER REQUEST STATUS
+// GET /speaker/status?streamId=...
+// ==================================================
+
+app.get("/speaker/status", async (req, res) => {
+  try {
+    const user = await authenticateUser(req, res);
+    if (!user) return;
+
+    const streamId = req.query.streamId;
+
+    if (!streamId) {
+      return res.status(400).json({
+        error: "Stream ID is required",
+      });
+    }
+
+    const stream = await getActiveStream(streamId);
+
+    if (!stream) {
+      return res.status(404).json({
+        error: "Live session not found or has ended",
+      });
+    }
+
+    if (stream.user_id === user.id) {
+      return res.status(400).json({
+        error: "The host does not need speaker approval",
+      });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("live_speaker_requests")
+      .select("id, stream_id, user_id, status, created_at, updated_at")
+      .eq("stream_id", stream.id)
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error("SPEAKER STATUS ERROR:", error);
+      throw error;
+    }
+
+    return res.status(200).json({
+      request: data || null,
+    });
+
+  } catch (error) {
+    console.error("GET SPEAKER STATUS ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to check speaker request status",
+    });
+  }
+});
 
 // ==================================================
 // HOST: VIEW PENDING SPEAKER REQUESTS
