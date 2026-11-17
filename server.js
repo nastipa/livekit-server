@@ -56,6 +56,35 @@ for (const key of requiredEnv) {
 }
 
 // ==================================================
+// LIVEKIT TRACK CONSTANTS
+// ==================================================
+
+// LiveKit TrackType.AUDIO = 0
+const LIVEKIT_AUDIO_TRACK_TYPE = 0;
+
+// LiveKit TrackSource values
+const LIVEKIT_TRACK_SOURCE = {
+  CAMERA: 1,
+  MICROPHONE: 2,
+  SCREEN_SHARE: 3,
+  SCREEN_SHARE_AUDIO: 4,
+};
+
+// When muted, a speaker can still publish video.
+const SPEAKER_MUTED_SOURCES = [
+  LIVEKIT_TRACK_SOURCE.CAMERA,
+  LIVEKIT_TRACK_SOURCE.SCREEN_SHARE,
+];
+
+// When unmuted, a speaker can publish audio and video.
+const SPEAKER_UNMUTED_SOURCES = [
+  LIVEKIT_TRACK_SOURCE.CAMERA,
+  LIVEKIT_TRACK_SOURCE.MICROPHONE,
+  LIVEKIT_TRACK_SOURCE.SCREEN_SHARE,
+  LIVEKIT_TRACK_SOURCE.SCREEN_SHARE_AUDIO,
+];
+
+// ==================================================
 // SUPABASE ADMIN CLIENT
 // ==================================================
 
@@ -95,6 +124,7 @@ async function authenticateUser(req, res) {
     res.status(401).json({
       error: "Authentication required",
     });
+
     return null;
   }
 
@@ -109,6 +139,7 @@ async function authenticateUser(req, res) {
     res.status(401).json({
       error: "Invalid or expired login session",
     });
+
     return null;
   }
 
@@ -137,6 +168,47 @@ async function getActiveStream(streamId) {
 }
 
 // ==================================================
+// GET HOST-OWNED SPEAKER REQUEST
+// ==================================================
+
+async function getHostSpeakerRequest(requestId, user) {
+  const { data: request, error } = await supabaseAdmin
+    .from("live_speaker_requests")
+    .select(
+      "id, stream_id, user_id, status, host_muted, host_muted_track_sids"
+    )
+    .eq("id", requestId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  if (!request) {
+    return {
+      error: "Speaker request not found",
+    };
+  }
+
+  const stream = await getActiveStream(request.stream_id);
+
+  if (!stream) {
+    return {
+      error: "Live session not found or has ended",
+    };
+  }
+
+  if (stream.user_id !== user.id) {
+    return {
+      error: "Only the host can manage speaker requests",
+    };
+  }
+
+  return {
+    request,
+    stream,
+  };
+}
+
+// ==================================================
 // HEALTH CHECK
 // ==================================================
 
@@ -146,9 +218,14 @@ app.get("/", (req, res) => {
 
 // ==================================================
 // CREATE LIVEKIT TOKEN
+//
 // HOST = PUBLISH
 // APPROVED SPEAKER = PUBLISH
 // NORMAL VIEWER = WATCH ONLY
+//
+// MUTED SPEAKER:
+// - Camera remains allowed.
+// - Microphone publishing is blocked.
 // ==================================================
 
 app.post("/token", async (req, res) => {
@@ -185,11 +262,12 @@ app.post("/token", async (req, res) => {
     const isHost = stream.user_id === user.id;
 
     let isApprovedSpeaker = false;
+    let speakerMuted = false;
 
     if (!isHost) {
       const { data: speakerRequest, error } = await supabaseAdmin
         .from("live_speaker_requests")
-        .select("id, status")
+        .select("id, status, host_muted")
         .eq("stream_id", stream.id)
         .eq("user_id", user.id)
         .eq("status", "approved")
@@ -204,6 +282,10 @@ app.post("/token", async (req, res) => {
       }
 
       isApprovedSpeaker = !!speakerRequest;
+
+      speakerMuted =
+        isApprovedSpeaker &&
+        speakerRequest.host_muted === true;
     }
 
     const canPublish = isHost || isApprovedSpeaker;
@@ -219,12 +301,21 @@ app.post("/token", async (req, res) => {
       }
     );
 
-    token.addGrant({
+    const grant = {
       roomJoin: true,
       room: roomName,
       canPublish,
       canSubscribe: true,
-    });
+    };
+
+    // Restrict approved speakers to the appropriate sources.
+    if (isApprovedSpeaker) {
+      grant.canPublishSources = speakerMuted
+        ? SPEAKER_MUTED_SOURCES
+        : SPEAKER_UNMUTED_SOURCES;
+    }
+
+    token.addGrant(grant);
 
     const jwt = await token.toJwt();
 
@@ -238,6 +329,7 @@ app.post("/token", async (req, res) => {
           ? "speaker"
           : "viewer",
       canPublish,
+      hostMuted: speakerMuted,
     });
 
   } catch (error) {
@@ -312,6 +404,8 @@ app.post("/speaker/request", async (req, res) => {
         .from("live_speaker_requests")
         .update({
           status: "pending",
+          host_muted: false,
+          host_muted_track_sids: [],
           updated_at: new Date().toISOString(),
           created_at: new Date().toISOString(),
         })
@@ -351,6 +445,7 @@ app.post("/speaker/request", async (req, res) => {
     });
   }
 });
+
 // ==================================================
 // VIEWER: CHECK OWN SPEAKER REQUEST STATUS
 // GET /speaker/status?streamId=...
@@ -463,31 +558,90 @@ app.get("/speaker/requests", async (req, res) => {
 });
 
 // ==================================================
-// HOST: APPROVE OR REJECT A SPEAKER REQUEST
+// HOST: VIEW ALL APPROVED SPEAKERS
+// GET /speaker/approved?streamId=...
 // ==================================================
 
-async function getHostSpeakerRequest(requestId, user) {
-  const { data: request, error } = await supabaseAdmin
-    .from("live_speaker_requests")
-    .select("id, stream_id, user_id, status")
-    .eq("id", requestId)
-    .maybeSingle();
+app.get("/speaker/approved", async (req, res) => {
+  try {
+    const user = await authenticateUser(req, res);
+    if (!user) return;
 
-  if (error) throw error;
-  if (!request) return { error: "Speaker request not found" };
+    const streamId = req.query.streamId;
 
-  const stream = await getActiveStream(request.stream_id);
+    if (!streamId) {
+      return res.status(400).json({
+        error: "Stream ID is required",
+      });
+    }
 
-  if (!stream) {
-    return { error: "Live session not found or has ended" };
+    const stream = await getActiveStream(streamId);
+
+    if (!stream) {
+      return res.status(404).json({
+        error: "Live session not found or has ended",
+      });
+    }
+
+    if (stream.user_id !== user.id) {
+      return res.status(403).json({
+        error: "Only the host can view approved speakers",
+      });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from("live_speaker_requests")
+      .select(
+        "id, stream_id, user_id, status, host_muted, created_at"
+      )
+      .eq("stream_id", stream.id)
+      .eq("status", "approved")
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    let participants = [];
+
+    try {
+      participants = await roomService.listParticipants(
+        `nasara-${stream.id}`
+      );
+    } catch (roomError) {
+      console.warn(
+        "COULD NOT LOAD LIVEKIT PARTICIPANTS:",
+        roomError.message
+      );
+    }
+
+    const participantMap = new Map(
+      participants.map((participant) => [
+        participant.identity,
+        participant,
+      ])
+    );
+
+    const speakers = (data || []).map((request) => {
+      const participant = participantMap.get(request.user_id);
+
+      return {
+        ...request,
+        participant_name: participant?.name || null,
+        is_connected: !!participant,
+      };
+    });
+
+    return res.status(200).json({
+      speakers,
+    });
+
+  } catch (error) {
+    console.error("GET APPROVED SPEAKERS ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to load approved speakers",
+    });
   }
-
-  if (stream.user_id !== user.id) {
-    return { error: "Only the host can manage speaker requests" };
-  }
-
-  return { request, stream };
-}
+});
 
 // ==================================================
 // HOST: APPROVE SPEAKER
@@ -525,11 +679,13 @@ app.post("/speaker/approve", async (req, res) => {
       .from("live_speaker_requests")
       .update({
         status: "approved",
+        host_muted: false,
+        host_muted_track_sids: [],
         updated_at: new Date().toISOString(),
       })
       .eq("id", requestId)
       .eq("status", "pending")
-      .select("id, stream_id, user_id, status")
+      .select("id, stream_id, user_id, status, host_muted")
       .maybeSingle();
 
     if (error) throw error;
@@ -590,6 +746,8 @@ app.post("/speaker/reject", async (req, res) => {
       .from("live_speaker_requests")
       .update({
         status: "rejected",
+        host_muted: false,
+        host_muted_track_sids: [],
         updated_at: new Date().toISOString(),
       })
       .eq("id", requestId)
@@ -614,7 +772,228 @@ app.post("/speaker/reject", async (req, res) => {
     console.error("REJECT SPEAKER ERROR:", error);
 
     return res.status(500).json({
-      error: "Unable to reject speaker request",
+      error: "Unable to reject speaker",
+    });
+  }
+});
+
+// ==================================================
+// HOST: MUTE OR UNMUTE APPROVED SPEAKER
+//
+// POST /speaker/mute
+//
+// Body:
+// {
+//   "requestId": "...",
+//   "muted": true
+// }
+//
+// muted = true  -> mute
+// muted = false -> unmute
+// ==================================================
+
+app.post("/speaker/mute", async (req, res) => {
+  try {
+    const user = await authenticateUser(req, res);
+    if (!user) return;
+
+    const { requestId, muted } = req.body;
+
+    if (!requestId) {
+      return res.status(400).json({
+        error: "Request ID is required",
+      });
+    }
+
+    if (typeof muted !== "boolean") {
+      return res.status(400).json({
+        error: "Muted must be true or false",
+      });
+    }
+
+    const result = await getHostSpeakerRequest(requestId, user);
+
+    if (result.error) {
+      return res.status(403).json({
+        error: result.error,
+      });
+    }
+
+    const request = result.request;
+    const stream = result.stream;
+
+    if (request.status !== "approved") {
+      return res.status(409).json({
+        error: "This user is not an approved speaker",
+      });
+    }
+
+    const previousMuted = request.host_muted === true;
+
+    if (previousMuted === muted) {
+      return res.status(200).json({
+        message: muted
+          ? "Speaker is already muted"
+          : "Speaker is already unmuted",
+        muted,
+      });
+    }
+
+    const roomName = `nasara-${stream.id}`;
+
+    let participants = [];
+
+    try {
+      participants = await roomService.listParticipants(roomName);
+    } catch (roomError) {
+      console.warn(
+        "LIVEKIT ROOM NOT AVAILABLE FOR SPEAKER CONTROL:",
+        roomError.message
+      );
+    }
+
+    const participant = participants.find(
+      (item) => item.identity === request.user_id
+    );
+
+    let mutedTrackSids = request.host_muted_track_sids || [];
+
+    if (participant) {
+      const previousPermission = participant.permission || {
+        canPublish: true,
+        canSubscribe: true,
+        canPublishData: true,
+      };
+
+      const audioTracks = (participant.tracks || []).filter(
+        (track) => track.type === LIVEKIT_AUDIO_TRACK_TYPE
+      );
+
+      try {
+        if (muted) {
+          // Record only audio tracks that were not already muted.
+          mutedTrackSids = audioTracks
+            .filter((track) => track.muted !== true)
+            .map((track) => track.sid);
+
+          // Block new microphone and screen-share audio publications.
+          // Camera and screen-share video remain allowed.
+          await roomService.updateParticipant(
+            roomName,
+            request.user_id,
+            {
+              permission: {
+                ...previousPermission,
+                canPublish: true,
+                canSubscribe: true,
+                canPublishData:
+                  previousPermission.canPublishData !== false,
+                canPublishSources: SPEAKER_MUTED_SOURCES,
+              },
+            }
+          );
+
+          // Mute all currently published audio tracks.
+          for (const track of audioTracks) {
+            if (track.muted !== true) {
+              await roomService.mutePublishedTrack(
+                roomName,
+                request.user_id,
+                track.sid,
+                true
+              );
+            }
+          }
+
+        } else {
+          // Restore only tracks that were unmuted before
+          // the host muted this speaker.
+          const tracksToUnmute = audioTracks.filter(
+            (track) => mutedTrackSids.includes(track.sid)
+          );
+
+          for (const track of tracksToUnmute) {
+            await roomService.mutePublishedTrack(
+              roomName,
+              request.user_id,
+              track.sid,
+              false
+            );
+          }
+
+          // Allow the speaker to publish audio and video again.
+          await roomService.updateParticipant(
+            roomName,
+            request.user_id,
+            {
+              permission: {
+                ...previousPermission,
+                canPublish: true,
+                canSubscribe: true,
+                canPublishData:
+                  previousPermission.canPublishData !== false,
+                canPublishSources: SPEAKER_UNMUTED_SOURCES,
+              },
+            }
+          );
+
+          mutedTrackSids = [];
+        }
+
+      } catch (liveKitError) {
+        console.error(
+          "LIVEKIT SPEAKER MUTE ERROR:",
+          liveKitError
+        );
+
+        // Try to restore the participant's previous permissions.
+        try {
+          await roomService.updateParticipant(
+            roomName,
+            request.user_id,
+            {
+              permission: previousPermission,
+            }
+          );
+        } catch (restoreError) {
+          console.error(
+            "SPEAKER PERMISSION RESTORE ERROR:",
+            restoreError
+          );
+        }
+
+        throw liveKitError;
+      }
+    }
+
+    // Save the host's mute state.
+    // This also applies when the speaker is currently disconnected.
+    const { error: updateError } = await supabaseAdmin
+      .from("live_speaker_requests")
+      .update({
+        host_muted: muted,
+        host_muted_track_sids: muted ? mutedTrackSids : [],
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", requestId)
+      .eq("status", "approved");
+
+    if (updateError) throw updateError;
+
+    return res.status(200).json({
+      message: muted
+        ? "Speaker muted"
+        : "Speaker unmuted",
+      muted,
+      connected: !!participant,
+    });
+
+  } catch (error) {
+    console.error("MUTE / UNMUTE SPEAKER ERROR:", error);
+
+    return res.status(500).json({
+      error: error.message ||
+        "Unable to change speaker mute state",
     });
   }
 });
@@ -651,11 +1030,13 @@ app.post("/speaker/remove", async (req, res) => {
       });
     }
 
-    // Revoke permission in Supabase first.
+    // Revoke speaker permission in Supabase first.
     const { error } = await supabaseAdmin
       .from("live_speaker_requests")
       .update({
         status: "rejected",
+        host_muted: false,
+        host_muted_track_sids: [],
         updated_at: new Date().toISOString(),
       })
       .eq("id", requestId)
@@ -663,17 +1044,27 @@ app.post("/speaker/remove", async (req, res) => {
 
     if (error) throw error;
 
-    // Disconnect the speaker from the LiveKit room.
+    // Disconnect the speaker and revoke their current token.
     let disconnected = true;
 
     try {
       await roomService.removeParticipant(
         `nasara-${result.stream.id}`,
-        result.request.user_id
+        result.request.user_id,
+        {
+          revokeTokenTs: BigInt(
+            Math.floor(Date.now() / 1000)
+          ),
+        }
       );
+
     } catch (removeError) {
       disconnected = false;
-      console.error("LIVEKIT SPEAKER DISCONNECT ERROR:", removeError);
+
+      console.error(
+        "LIVEKIT SPEAKER DISCONNECT ERROR:",
+        removeError
+      );
     }
 
     return res.status(200).json({
@@ -697,5 +1088,7 @@ app.post("/speaker/remove", async (req, res) => {
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
-  console.log(`Nasara LiveKit server running on port ${PORT}`);
+  console.log(
+    `Nasara LiveKit server running on port ${PORT}`
+  );
 });
