@@ -612,7 +612,7 @@ app.post("/speaker/remove", async (req, res) => {
 
     try {
       await roomService.removeParticipant(
-        `nasara-${result.stream.id`},
+        `nasara-${result.stream.id}`,
         result.request.user_id
       );
     } catch (removeError) {
