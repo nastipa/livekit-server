@@ -480,18 +480,22 @@ app.get("/speaker/status", async (req, res) => {
 
     const { data, error } = await supabaseAdmin
       .from("live_speaker_requests")
-      .select("id, stream_id, user_id, status, created_at, updated_at")
+      .select(
+        "id, stream_id, user_id, status, host_muted, created_at, updated_at"
+      )
       .eq("stream_id", stream.id)
       .eq("user_id", user.id)
       .maybeSingle();
 
-    if (error) {
-      console.error("SPEAKER STATUS ERROR:", error);
-      throw error;
-    }
+    if (error) throw error;
 
     return res.status(200).json({
-      request: data || null,
+      request: data
+        ? {
+            ...data,
+            host_muted: data.host_muted === true,
+          }
+        : null,
     });
 
   } catch (error) {
