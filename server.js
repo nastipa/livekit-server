@@ -836,6 +836,7 @@ app.post("/speaker/mute", async (req, res) => {
           ? "Speaker is already muted"
           : "Speaker is already unmuted",
         muted,
+        connected: false,
       });
     }
 
@@ -856,7 +857,10 @@ app.post("/speaker/mute", async (req, res) => {
       (item) => item.identity === request.user_id
     );
 
-    let mutedTrackSids = request.host_muted_track_sids || [];
+    let mutedTrackSids =
+      request.host_muted_track_sids || [];
+
+    let restoredTrackCount = 0;
 
     if (participant) {
       const previousPermission = participant.permission || {
@@ -866,18 +870,33 @@ app.post("/speaker/mute", async (req, res) => {
       };
 
       const audioTracks = (participant.tracks || []).filter(
-        (track) => track.type === LIVEKIT_AUDIO_TRACK_TYPE
+        (track) =>
+          track.type === LIVEKIT_AUDIO_TRACK_TYPE
       );
 
       try {
         if (muted) {
-          // Record only audio tracks that were not already muted.
+          // Remember the audio tracks that were not
+          // already muted before the host action.
           mutedTrackSids = audioTracks
             .filter((track) => track.muted !== true)
             .map((track) => track.sid);
 
-          // Block new microphone and screen-share audio publications.
-          // Camera and screen-share video remain allowed.
+          // First mute the existing audio tracks.
+          // This mutes the speaker for everybody.
+          for (const track of audioTracks) {
+            if (track.muted !== true) {
+              await roomService.mutePublishedTrack(
+                roomName,
+                request.user_id,
+                track.sid,
+                true
+              );
+            }
+          }
+
+          // Then prevent new microphone/audio publications
+          // while the speaker is host-muted.
           await roomService.updateParticipant(
             roomName,
             request.user_id,
@@ -893,35 +912,10 @@ app.post("/speaker/mute", async (req, res) => {
             }
           );
 
-          // Mute all currently published audio tracks.
-          for (const track of audioTracks) {
-            if (track.muted !== true) {
-              await roomService.mutePublishedTrack(
-                roomName,
-                request.user_id,
-                track.sid,
-                true
-              );
-            }
-          }
-
         } else {
-          // Restore only tracks that were unmuted before
-          // the host muted this speaker.
-          const tracksToUnmute = audioTracks.filter(
-            (track) => mutedTrackSids.includes(track.sid)
-          );
-
-          for (const track of tracksToUnmute) {
-            await roomService.mutePublishedTrack(
-              roomName,
-              request.user_id,
-              track.sid,
-              false
-            );
-          }
-
-          // Allow the speaker to publish audio and video again.
+          // IMPORTANT:
+          // Restore microphone permission FIRST.
+          // Previously this happened after track unmuting.
           await roomService.updateParticipant(
             roomName,
             request.user_id,
@@ -937,16 +931,36 @@ app.post("/speaker/mute", async (req, res) => {
             }
           );
 
+          // Now unmute the same audio tracks that the
+          // host muted. Do not disconnect the speaker.
+          const tracksToUnmute = audioTracks.filter(
+            (track) =>
+              track.muted === true &&
+              mutedTrackSids.includes(track.sid)
+          );
+
+          for (const track of tracksToUnmute) {
+            await roomService.mutePublishedTrack(
+              roomName,
+              request.user_id,
+              track.sid,
+              false
+            );
+
+            restoredTrackCount += 1;
+          }
+
           mutedTrackSids = [];
         }
 
       } catch (liveKitError) {
         console.error(
-          "LIVEKIT SPEAKER MUTE ERROR:",
+          "LIVEKIT SPEAKER MUTE / UNMUTE ERROR:",
           liveKitError
         );
 
-        // Try to restore the participant's previous permissions.
+        // Restore the permissions that existed before
+        // this request if any LiveKit operation fails.
         try {
           await roomService.updateParticipant(
             roomName,
@@ -966,19 +980,30 @@ app.post("/speaker/mute", async (req, res) => {
       }
     }
 
-    // Save the host's mute state.
-    // This also applies when the speaker is currently disconnected.
-    const { error: updateError } = await supabaseAdmin
-      .from("live_speaker_requests")
-      .update({
-        host_muted: muted,
-        host_muted_track_sids: muted ? mutedTrackSids : [],
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", requestId)
-      .eq("status", "approved");
+    // Save the mute state only after LiveKit operations
+    // have completed successfully.
+    const { data: updatedRequest, error: updateError } =
+      await supabaseAdmin
+        .from("live_speaker_requests")
+        .update({
+          host_muted: muted,
+          host_muted_track_sids: muted
+            ? mutedTrackSids
+            : [],
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", requestId)
+        .eq("status", "approved")
+        .select("id, host_muted")
+        .maybeSingle();
 
     if (updateError) throw updateError;
+
+    if (!updatedRequest) {
+      throw new Error(
+        "Could not save the speaker mute state"
+      );
+    }
 
     return res.status(200).json({
       message: muted
@@ -986,13 +1011,18 @@ app.post("/speaker/mute", async (req, res) => {
         : "Speaker unmuted",
       muted,
       connected: !!participant,
+      restoredTrackCount,
     });
 
   } catch (error) {
-    console.error("MUTE / UNMUTE SPEAKER ERROR:", error);
+    console.error(
+      "MUTE / UNMUTE SPEAKER ERROR:",
+      error
+    );
 
     return res.status(500).json({
-      error: error.message ||
+      error:
+        error.message ||
         "Unable to change speaker mute state",
     });
   }
